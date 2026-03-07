@@ -72,7 +72,7 @@ app.post('/register', async (req, res) => {
 // サーバー起動
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(\`🌐 Registration Server running on port \${PORT}\`);
+  console.log(`🌐 Registration Server running on port ${PORT}`);
 });
 
 // --- 従来のスクレイピングループ処理 ---
@@ -80,7 +80,7 @@ async function startSaaS() {
   await startDB();
   
   while (true) {
-    console.log(\`\\n🔄 [\${new Date().toISOString()}] Starting scan round...\`);
+    console.log(`\n🔄 [${new Date().toISOString()}] Starting scan round...`);
     try {
       const { rows: accounts } = await pgClient.query(
         "SELECT * FROM burner_accounts WHERE status = 'active' ORDER BY last_used_at ASC NULLS FIRST LIMIT 5"
@@ -111,7 +111,7 @@ async function startSaaS() {
           scanSuccess = true;
           break;
         } catch (scanErr) {
-          console.warn(\`⚠️ Account \${account.email} failed. Error details:\`, scanErr.message);
+          console.warn(`⚠️ Account ${account.email} failed. Error details:`, scanErr.message);
         }
       }
 
