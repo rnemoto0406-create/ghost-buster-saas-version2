@@ -5,13 +5,20 @@ require('dotenv').config();
 const { Client }      = require('pg');
 const { createClient } = require('redis');
 const { runScanner }  = require('./scraper');
+const express         = require('express');
 
 const SCAN_INTERVAL_MS  = 5 * 60 * 1000; // 5 minutes
-const RETRY_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes when no accounts/users
+const RETRY_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 
-async function startSaaS() {
-  const pgClient    = new Client({ connectionString: process.env.DATABASE_URL });
-  const redisClient = createClient({ url: process.env.REDIS_URL });
+// --- Webサーバーの設定 ---
+const app = express();
+app.use(express.urlencoded({ extended: true }));
+
+let pgClient, redisClient;
+
+async function startDB() {
+  pgClient    = new Client({ connectionString: process.env.DATABASE_URL });
+  redisClient = createClient({ url: process.env.REDIS_URL });
 
   redisClient.on('error', (err) => console.error('⚠️ Redis error:', err.message));
 
@@ -21,15 +28,60 @@ async function startSaaS() {
     console.log('✅ DB Connected (Postgres & Redis)');
   } catch (err) {
     console.error('💀 Failed to connect to DBs:', err.message);
-    process.exit(1); // Railway will auto-restart
+    process.exit(1);
   }
+}
 
-  // ── Main loop ─────────────────────────────────────────────────────────────
+// 登録フォーム画面（Ross氏がアクセスする入り口）
+app.get('/', (req, res) => {
+  res.send(`
+    <html>
+      <head>
+        <title>Upwork Scanner Setup</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+      </head>
+      <body style="font-family: sans-serif; padding: 2rem; max-width: 600px; margin: 0 auto;">
+        <h2>SaaS Webhook Registration</h2>
+        <p>Please enter your Discord or Slack Webhook URL below to start receiving Upwork job notifications.</p>
+        <form action="/register" method="POST">
+          <input type="hidden" name="email" value="ross@example.com" />
+          <label style="font-weight: bold;">Webhook URL:</label><br/>
+          <input type="url" name="webhook_url" required style="width: 100%; padding: 10px; margin-top: 8px; margin-bottom: 20px; box-sizing: border-box;" placeholder="https://..." />
+          <button type="submit" style="padding: 10px 20px; font-size: 16px; cursor: pointer; background-color: #0056b3; color: white; border: none; border-radius: 4px;">Start Monitoring</button>
+        </form>
+      </body>
+    </html>
+  `);
+});
+
+// フォーム送信時のDB登録処理
+app.post('/register', async (req, res) => {
+  const { email, webhook_url } = req.body;
+  try {
+    await pgClient.query(
+      'INSERT INTO users (email, webhook_url, max_risk, is_active) VALUES ($1, $2, $3, $4) ON CONFLICT (email) DO UPDATE SET webhook_url = EXCLUDED.webhook_url, max_risk = EXCLUDED.max_risk, is_active = EXCLUDED.is_active',
+      [email, webhook_url, 40, true]
+    );
+    res.send('<div style="font-family: sans-serif; padding: 2rem; text-align: center;"><h2 style="color: green;">✅ Registration Complete!</h2><p>You can close this window. The scanner will now send jobs to your webhook.</p></div>');
+  } catch (error) {
+    console.error(error);
+    res.send('<div style="font-family: sans-serif; padding: 2rem; text-align: center;"><h2 style="color: red;">❌ Registration Failed</h2><p>Please contact support.</p></div>');
+  }
+});
+
+// サーバー起動
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(\`🌐 Registration Server running on port \${PORT}\`);
+});
+
+// --- 従来のスクレイピングループ処理 ---
+async function startSaaS() {
+  await startDB();
+  
   while (true) {
-    console.log(`\n🔄 [${new Date().toISOString()}] Starting scan round...`);
-
+    console.log(\`\\n🔄 [\${new Date().toISOString()}] Starting scan round...\`);
     try {
-      // Fetch active account and users fresh every round
       const { rows: accounts } = await pgClient.query(
         "SELECT * FROM burner_accounts WHERE status = 'active' ORDER BY last_used_at ASC NULLS FIRST LIMIT 5"
       );
@@ -48,22 +100,18 @@ async function startSaaS() {
         continue;
       }
 
-      // Try accounts in order until one succeeds
       let scanSuccess = false;
       for (const account of accounts) {
         try {
           await runScanner({ account, users, redis: redisClient, pg: pgClient });
-          // Mark account as used
           await pgClient.query(
             'UPDATE burner_accounts SET last_used_at = NOW() WHERE id = $1',
             [account.id]
           );
           scanSuccess = true;
-          break; // Success — no need to try more accounts
+          break;
         } catch (scanErr) {
-          // ★修正箇所：エラーの正確な原因とスタックトレースをログに出力させる
-          console.warn(`⚠️ Account ${account.email} failed. Error details:`, scanErr.message);
-          console.warn(scanErr.stack);
+          console.warn(\`⚠️ Account \${account.email} failed. Error details:\`, scanErr.message);
         }
       }
 
@@ -71,10 +119,8 @@ async function startSaaS() {
         console.error('❌ All accounts failed this round. Will retry in 5 min.');
       }
     } catch (err) {
-      // DB query errors — transient, log and continue
       console.error('❌ Loop error:', err.message);
     }
-
     await sleep(SCAN_INTERVAL_MS);
   }
 }
