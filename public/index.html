@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ghost Buster - Dashboard</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    /* ログ用のカスタムスクロールバー */
+    #logs::-webkit-scrollbar { width: 8px; }
+    #logs::-webkit-scrollbar-track { background: #1f2937; }
+    #logs::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 4px; }
+  </style>
+</head>
+<body class="bg-gray-900 text-gray-100 font-sans antialiased p-6">
+  <div class="max-w-5xl mx-auto grid grid-cols-1 lg:grid-cols-2 gap-6">
+    
+    <div class="bg-gray-800 p-6 rounded-xl shadow-lg border border-gray-700">
+      <div class="flex items-center mb-6">
+        <span class="text-3xl mr-3">👻</span>
+        <h1 class="text-2xl font-bold">Ghost Buster</h1>
+      </div>
+
+      <form id="configForm" class="space-y-4">
+        <div>
+          <label class="block text-sm font-medium text-gray-400 mb-1">Webhook URL <span class="text-red-400">*</span></label>
+          <input type="url" id="webhookUrl" required class="w-full bg-gray-900 border border-gray-600 rounded px-3 py-2 focus:outline-none focus:border-blue-500 text-sm">
+        </div>
+
+        <div>
+          <label class="block text-sm font-medium text-gray-400 mb-1">Residential Proxy URL</label>
+          <input type="text" id="proxyUrl" placeholder="http://user:pass@host:port" class="w-full bg-gray-900 border border-gray-600 rounded px-3 py-2 focus:outline-none focus:border-blue-500 text-sm">
+        </div>
+
+        <div class="grid grid-cols-2 gap-4">
+          <div>
+            <label class="block text-sm font-medium text-gray-400 mb-1">Max Risk Score (0-100)</label>
+            <input type="number" id="maxRisk" value="40" class="w-full bg-gray-900 border border-gray-600 rounded px-3 py-2 focus:outline-none focus:border-blue-500 text-sm">
+          </div>
+          <div>
+            <label class="block text-sm font-medium text-gray-400 mb-1">Browser Mode</label>
+            <select id="headless" class="w-full bg-gray-900 border border-gray-600 rounded px-3 py-2 focus:outline-none focus:border-blue-500 text-sm">
+              <option value="true">Headless (Invisible)</option>
+              <option value="false">Show Browser</option>
+            </select>
+          </div>
+        </div>
+
+        <div>
+          <label class="block text-sm font-medium text-gray-400 mb-1">Upwork Session Cookie (JSON) <span class="text-red-400">*</span></label>
+          <p class="text-xs text-gray-500 mb-2">EditThisCookieでエクスポートしたJSONを貼り付けてください</p>
+          <textarea id="cookieJson" rows="4" required placeholder='[{"domain": ".upwork.com", ...}]' class="w-full bg-gray-900 border border-gray-600 rounded px-3 py-2 focus:outline-none focus:border-blue-500 text-sm font-mono"></textarea>
+        </div>
+
+        <button type="submit" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded transition-colors">
+          💾 Save Configuration
+        </button>
+      </form>
+    </div>
+
+    <div class="bg-gray-800 p-6 rounded-xl shadow-lg border border-gray-700 flex flex-col">
+      <h2 class="text-xl font-bold mb-4">Control Panel</h2>
+      
+      <div class="flex space-x-4 mb-6">
+        <button id="startBtn" class="flex-1 bg-green-600 hover:bg-green-700 text-white font-bold py-3 px-4 rounded opacity-50 cursor-not-allowed transition-colors" disabled>
+          ▶ Start Scanner
+        </button>
+        <button id="stopBtn" class="flex-1 bg-red-600 hover:bg-red-700 text-white font-bold py-3 px-4 rounded hidden transition-colors">
+          ⏹ Stop Scanner
+        </button>
+      </div>
+
+      <div class="flex-1 flex flex-col min-h-[300px]">
+        <div class="flex justify-between items-center mb-2">
+          <h3 class="text-sm font-medium text-gray-400">Live Logs</h3>
+          <span id="statusBadge" class="text-xs px-2 py-1 rounded bg-gray-700 text-gray-300">Status: Stopped</span>
+        </div>
+        <div id="logs" class="flex-1 bg-gray-900 border border-gray-700 rounded p-3 overflow-y-auto font-mono text-xs text-green-400 whitespace-pre-wrap"></div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const form = document.getElementById('configForm');
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const logsEl = document.getElementById('logs');
+    const statusBadge = document.getElementById('statusBadge');
+
+    let logInterval;
+
+    // Load initial status and config
+    async function loadStatus() {
+      const res = await fetch('/api/status');
+      const data = await res.json();
+      
+      if (data.config) {
+        document.getElementById('webhookUrl').value = data.config.webhookUrl || '';
+        document.getElementById('proxyUrl').value = data.config.proxyUrl || '';
+        document.getElementById('maxRisk').value = data.config.maxRisk || 40;
+        document.getElementById('headless').value = data.config.headless ? 'true' : 'false';
+      }
+      
+      if (data.hasSession) {
+        document.getElementById('cookieJson').value = '[Cookie Saved]';
+        startBtn.disabled = false;
+        startBtn.classList.remove('opacity-50', 'cursor-not-allowed');
+      }
+
+      updateUIState(data.isRunning);
+    }
+
+    // Save config
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const payload = {
+        webhookUrl: document.getElementById('webhookUrl').value,
+        proxyUrl: document.getElementById('proxyUrl').value,
+        maxRisk: parseInt(document.getElementById('maxRisk').value),
+        headless: document.getElementById('headless').value === 'true',
+        cookieJson: document.getElementById('cookieJson').value
+      };
+
+      const res = await fetch('/api/save', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+
+      if (res.ok) {
+        alert('Configuration saved successfully!');
+        startBtn.disabled = false;
+        startBtn.classList.remove('opacity-50', 'cursor-not-allowed');
+      } else {
+        alert('Failed to save configuration.');
+      }
+    });
+
+    // Start scanner
+    startBtn.addEventListener('click', async () => {
+      await fetch('/api/start', { method: 'POST' });
+      updateUIState(true);
+    });
+
+    // Stop scanner
+    stopBtn.addEventListener('click', async () => {
+      await fetch('/api/stop', { method: 'POST' });
+      updateUIState(false);
+    });
+
+    function updateUIState(isRunning) {
+      if (isRunning) {
+        startBtn.classList.add('hidden');
+        stopBtn.classList.remove('hidden');
+        statusBadge.textContent = 'Status: Running';
+        statusBadge.className = 'text-xs px-2 py-1 rounded bg-green-900 text-green-300';
+        if (!logInterval) logInterval = setInterval(fetchLogs, 1000);
+      } else {
+        startBtn.classList.remove('hidden');
+        stopBtn.classList.add('hidden');
+        statusBadge.textContent = 'Status: Stopped / Stopping...';
+        statusBadge.className = 'text-xs px-2 py-1 rounded bg-gray-700 text-gray-300';
+        if (logInterval) { clearInterval(logInterval); logInterval = null; }
+        fetchLogs(); // final fetch
+      }
+    }
+
+    async function fetchLogs() {
+      const res = await fetch('/api/logs');
+      const data = await res.json();
+      if (data.logs.length > 0) {
+        logsEl.innerHTML = data.logs.join('\n');
+        logsEl.scrollTop = logsEl.scrollHeight; // Auto-scroll
+      }
+    }
+
+    // Init
+    loadStatus();
+    setInterval(fetchLogs, 2000); // Poll logs anyway
+  </script>
+</body>
+</html>
