@@ -13,6 +13,6 @@
     "redis": "^4.6.10"
   },
   "scripts": {
-    "start": "node index.js"
+    "start": "npx playwright install chromium --with-deps && node index.js"
   }
 }
