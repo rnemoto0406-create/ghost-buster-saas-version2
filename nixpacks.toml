@@ -1,39 +1,5 @@
-[phases.setup]
-nixPkgs = [
-  "chromium",
-  "nss",
-  "nspr",
-  "freetype",
-  "harfbuzz",
-  "expat",
-  "fontconfig",
-  "dbus",
-  "at-spi2-core",
-  "cups",
-  "libdrm",
-  "mesa",
-  "libxkbcommon",
-  "pango",
-  "cairo",
-  "glib",
-  "xorg.libX11",
-  "xorg.libXcomposite",
-  "xorg.libXdamage",
-  "xorg.libXext",
-  "xorg.libXfixes",
-  "xorg.libXrandr",
-  "xorg.libxcb",
-  "alsa-lib",
-  "gtk3",
-  "udev",
-  "libuuid"
-]
-
 [phases.install]
-cmds = ["npm ci"]
-
-[phases.build]
-cmds = ["npx playwright install chromium"]
+cmds = ["npm ci", "npx playwright install chromium --with-deps"]
 
 [start]
 cmd = "node index.js"
