@@ -8,10 +8,20 @@ const JOB_TTL_SECONDS = 60 * 60 * 24 * 7; // 7 days per job key
 const TARGET_URL      = 'https://www.upwork.com/nx/find-work/most-recent';
 
 async function runScanner({ account, users, redis, pg }) {
-  // session_json can be stored as a string or parsed JSONB
-  const cookies = typeof account.session_json === 'string'
+  const rawCookies = typeof account.session_json === 'string'
     ? JSON.parse(account.session_json)
     : account.session_json;
+
+  // ── Cookie Sanitization ────────────────────────────────────────────────
+  // EditThisCookieが出力する不正なsameSite値をPlaywright用に修正します
+  const validCookies = rawCookies.map(cookie => {
+    const c = { ...cookie };
+    if (c.sameSite === 'no_restriction') c.sameSite = 'None';
+    if (c.sameSite === 'unspecified' || !['Strict', 'Lax', 'None'].includes(c.sameSite)) {
+      delete c.sameSite;
+    }
+    return c;
+  });
 
   const browser = await chromium.launch({
     headless: true,
@@ -20,7 +30,7 @@ async function runScanner({ account, users, redis, pg }) {
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
       '--disable-gpu',
-      '--single-process',        // Important for low-memory Railway containers
+      '--single-process',
       '--disable-extensions',
     ],
   });
@@ -34,7 +44,7 @@ async function runScanner({ account, users, redis, pg }) {
   });
 
   try {
-    await context.addCookies(cookies);
+    await context.addCookies(validCookies);
     const page = await context.newPage();
 
     // ── Navigate ────────────────────────────────────────────────────────────
