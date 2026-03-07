@@ -61,8 +61,9 @@ async function startSaaS() {
           scanSuccess = true;
           break; // Success — no need to try more accounts
         } catch (scanErr) {
-          // runScanner already handles ban marking; just try next account
-          console.warn(`⚠️ Account ${account.email} failed, trying next...`);
+          // ★修正箇所：エラーの正確な原因とスタックトレースをログに出力させる
+          console.warn(`⚠️ Account ${account.email} failed. Error details:`, scanErr.message);
+          console.warn(scanErr.stack);
         }
       }
 
