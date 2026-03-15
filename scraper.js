@@ -1,27 +1,45 @@
 'use strict';
 
-const { chromium }     = require('playwright');
+const { chromium }      = require('playwright');
 const { pushToWebhook } = require('./webhook');
 const { buildJobPayload } = require('./scorer');
 
-const JOB_TTL_SECONDS = 60 * 60 * 24 * 7; // 7 days per job key
+const JOB_TTL_SECONDS = 60 * 60 * 24 * 7;
 const TARGET_URL      = 'https://www.upwork.com/nx/find-work/most-recent';
 
+// ── User-Agent pool ────────────────────────────────────────────────────────
+const USER_AGENTS = [
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 14.4; rv:125.0) Gecko/20100101 Firefox/125.0',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36 Edg/123.0.0.0',
+];
+
+function randomUA() {
+  return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+}
+
+// ── Random scan interval: 4〜8分 ───────────────────────────────────────────
+function randomIntervalMs() {
+  const min = 4 * 60 * 1000;
+  const max = 8 * 60 * 1000;
+  return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
 async function runScanner({ account, users, redis, pg }) {
-  const rawCookies = typeof account.session_json === 'string'
+  // session_json can be stored as a string or parsed JSONB
+  const cookies = typeof account.session_json === 'string'
     ? JSON.parse(account.session_json)
     : account.session_json;
 
-  // ── Cookie Sanitization ────────────────────────────────────────────────
-  // EditThisCookieが出力する不正なsameSite値をPlaywright用に修正します
-  const validCookies = rawCookies.map(cookie => {
-    const c = { ...cookie };
-    if (c.sameSite === 'no_restriction') c.sameSite = 'None';
-    if (c.sameSite === 'unspecified' || !['Strict', 'Lax', 'None'].includes(c.sameSite)) {
-      delete c.sameSite;
-    }
-    return c;
-  });
+  const ua = randomUA();
+  console.log(`🌐 Using UA: ${ua.slice(0, 60)}...`);
 
   const browser = await chromium.launch({
     headless: true,
@@ -36,15 +54,18 @@ async function runScanner({ account, users, redis, pg }) {
   });
 
   const context = await browser.newContext({
-    userAgent:
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
-      '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    userAgent: ua,
     locale: 'en-US',
-    timezoneId: 'America/New_York',
+    timezoneId: 'Europe/Amsterdam',
+    extraHTTPHeaders: {
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+      'Referer': 'https://www.upwork.com/',
+    },
   });
 
   try {
-    await context.addCookies(validCookies);
+    await context.addCookies(cookies);
     const page = await context.newPage();
 
     // ── Navigate ────────────────────────────────────────────────────────────
@@ -149,4 +170,4 @@ async function markBanned(pg, account) {
   console.warn(`🚫 Account ${account.email} marked as banned in DB.`);
 }
 
-module.exports = { runScanner };
+module.exports = { runScanner, randomIntervalMs };
