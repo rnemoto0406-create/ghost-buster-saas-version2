@@ -11,7 +11,12 @@ const RETRY_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes when no accounts/users
 
 async function startSaaS() {
   const pgClient    = new Client({ connectionString: process.env.DATABASE_URL });
-  const redisClient = createClient({ url: process.env.REDIS_URL });
+  const redisClient = createClient({
+    url: process.env.REDIS_URL,
+    socket: {
+      reconnectStrategy: (retries) => Math.min(retries * 500, 5000)
+    }
+  });
 
   redisClient.on('error', (err) => console.error('⚠️ Redis error:', err.message));
 
