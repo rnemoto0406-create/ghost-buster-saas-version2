@@ -1,13 +1,12 @@
 'use strict';
 
-const { chromium }      = require('playwright');
-const { pushToWebhook } = require('./webhook');
+const { chromium }        = require('playwright');
+const { pushToWebhook }   = require('./webhook');
 const { buildJobPayload } = require('./scorer');
 
 const JOB_TTL_SECONDS = 60 * 60 * 24 * 7;
 const TARGET_URL      = 'https://www.upwork.com/nx/find-work/most-recent';
 
-// ── User-Agent pool ────────────────────────────────────────────────────────
 const USER_AGENTS = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
@@ -25,18 +24,59 @@ function randomUA() {
   return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
 }
 
-// ── Random scan interval: 4〜8分 ───────────────────────────────────────────
 function randomIntervalMs() {
   const min = 4 * 60 * 1000;
   const max = 8 * 60 * 1000;
   return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
+// ── ユーザーの条件と案件がマッチするか判定 ────────────────────────────────
+function matchesUser(payload, user) {
+  // リスクスコアチェック
+  if (payload.risk_score > user.max_risk) return false;
+
+  // 予算下限チェック
+  if (user.min_budget && user.min_budget > 0) {
+    if (payload.budget_amount < user.min_budget) return false;
+  }
+
+  // キーワードチェック（title + description + skills のいずれかに含まれるか）
+  if (user.keywords) {
+    const keywords = user.keywords.toLowerCase().split(',').map(k => k.trim()).filter(Boolean);
+    const searchText = [
+      payload.title,
+      payload.description,
+      payload.skills,
+    ].join(' ').toLowerCase();
+
+    const hasKeyword = keywords.some(kw => searchText.includes(kw));
+    if (!hasKeyword) return false;
+  }
+
+  // カテゴリチェック
+  if (user.categories && payload.category) {
+    const categories = user.categories.toLowerCase().split(',').map(c => c.trim()).filter(Boolean);
+    const jobCategory = payload.category.toLowerCase();
+    const hasCategory = categories.some(cat => jobCategory.includes(cat));
+    if (!hasCategory) return false;
+  }
+
+  return true;
+}
+
 async function runScanner({ account, users, redis, pg }) {
-  // session_json can be stored as a string or parsed JSONB
-  const cookies = typeof account.session_json === 'string'
+  const rawCookies = typeof account.session_json === 'string'
     ? JSON.parse(account.session_json)
     : account.session_json;
+
+  const validCookies = rawCookies.map(cookie => {
+    const c = { ...cookie };
+    if (c.sameSite === 'no_restriction') c.sameSite = 'None';
+    if (c.sameSite === 'unspecified' || !['Strict', 'Lax', 'None'].includes(c.sameSite)) {
+      delete c.sameSite;
+    }
+    return c;
+  });
 
   const ua = randomUA();
   console.log(`🌐 Using UA: ${ua.slice(0, 60)}...`);
@@ -65,10 +105,9 @@ async function runScanner({ account, users, redis, pg }) {
   });
 
   try {
-    await context.addCookies(cookies);
+    await context.addCookies(validCookies);
     const page = await context.newPage();
 
-    // ── Navigate ────────────────────────────────────────────────────────────
     const response = await page.goto(TARGET_URL, {
       waitUntil: 'domcontentloaded',
       timeout: 30_000,
@@ -76,7 +115,6 @@ async function runScanner({ account, users, redis, pg }) {
 
     const currentUrl = page.url();
 
-    // ── Ban / session expiry detection ──────────────────────────────────────
     if (
       currentUrl.includes('/login') ||
       currentUrl.includes('/ab/account-security') ||
@@ -86,7 +124,6 @@ async function runScanner({ account, users, redis, pg }) {
       throw new Error(`BANNED: account ${account.email} redirected to ${currentUrl}`);
     }
 
-    // ── CAPTCHA detection ───────────────────────────────────────────────────
     const isCaptcha = await page.evaluate(() => {
       const title = document.title.toLowerCase();
       return (
@@ -102,9 +139,7 @@ async function runScanner({ account, users, redis, pg }) {
       throw new Error(`CAPTCHA: account ${account.email}`);
     }
 
-    // ── Extract jobs from Nuxt state ─────────────────────────────────────────
     const jobs = await page.evaluate(() => {
-      // Try primary Nuxt path
       const nuxt = window.__NUXT__?.state;
       if (nuxt) {
         return (
@@ -122,24 +157,21 @@ async function runScanner({ account, users, redis, pg }) {
       return;
     }
 
-    // ── Process jobs ─────────────────────────────────────────────────────────
-    let newCount   = 0;
-    let sentCount  = 0;
+    let newCount  = 0;
+    let sentCount = 0;
 
     for (const job of jobs) {
       if (!job.ciphertext) continue;
 
-      // Per-job Redis key with 7-day TTL (memory-efficient, no global set bloat)
       const redisKey = `seen:${job.ciphertext}`;
       const isNew    = await redis.set(redisKey, '1', { NX: true, EX: JOB_TTL_SECONDS });
-      if (!isNew) continue; // Already seen
+      if (!isNew) continue;
 
       newCount++;
       const payload = buildJobPayload(job);
 
-      // Fan-out to each matching user
       for (const user of users) {
-        if (payload.risk_score <= user.max_risk) {
+        if (matchesUser(payload, user)) {
           const result = await pushToWebhook(user.webhook_url, [payload], {
             totalScanned: jobs.length,
           });
@@ -156,7 +188,7 @@ async function runScanner({ account, users, redis, pg }) {
     console.log(`✅ Round complete. New: ${newCount}, Sent: ${sentCount}`);
   } catch (err) {
     console.error(`❌ Scraper error [${account.email}]: ${err.message}`);
-    throw err; // Bubble up so index.js can try next account
+    throw err;
   } finally {
     await browser.close();
   }
