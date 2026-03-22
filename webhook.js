@@ -7,33 +7,41 @@ async function pushToWebhook(webhookUrl, jobs, meta = {}) {
     return { ok: false, error: 'No webhook URL configured' };
   }
 
+  // 通知用のテキストメッセージを組み立てる
+  const jobTexts = jobs.map(job => 
+    `**${job.title}**\n` +
+    `💰 Budget: ${job.budget || 'N/A'}\n` +
+    `⚠️ Risk Score: ${job.risk_score} (Flags: ${job.risk_flags.length ? job.risk_flags.join(', ') : 'None'})\n` +
+    `🔗 ${job.url}`
+  ).join('\n\n---\n\n');
+
+  const message = `🚀 **Upwork Scanner Found ${jobs.length} Jobs** (Scanned: ${meta.totalScanned || 0})\n\n${jobTexts}`;
+
+  // Discord ('content') と Slack ('text') の両方に対応するペイロード
   const payload = {
-    source:         'Ghost Buster Server',
-    timestamp:      new Date().toISOString(),
-    total_scanned:  meta.totalScanned || 0,
-    low_risk_count: jobs.length,
-    jobs,
+    content: message,
+    text: message
   };
 
   const controller = new AbortController();
   const timer      = setTimeout(() => controller.abort(), TIMEOUT_MS);
 
   try {
-    const res = await fetch(webhookUrl, {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
+    const res = await fetch(webhookUrl, { //
+      method:  'POST', //
+      headers: { 'Content-Type': 'application/json' }, //
       body:    JSON.stringify(payload),
-      signal:  controller.signal,
+      signal:  controller.signal, //
     });
 
     return res.ok
-      ? { ok: true }
-      : { ok: false, status: res.status };
+      ? { ok: true } //
+      : { ok: false, status: res.status }; //
   } catch (err) {
-    return { ok: false, error: err.message };
+    return { ok: false, error: err.message }; //
   } finally {
-    clearTimeout(timer);
+    clearTimeout(timer); //
   }
 }
 
-module.exports = { pushToWebhook };
+module.exports = { pushToWebhook }; //
