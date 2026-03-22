@@ -1,5 +1,5 @@
 [phases.install]
-cmds = ["npm ci", "npx playwright install chromium --with-deps"]
+cmds = ["npm ci"]
 
 [start]
 cmd = "node index.js"

@@ -1,28 +1,11 @@
 'use strict';
 
-const { chromium }        = require('playwright');
-const { pushToWebhook }   = require('./webhook');
-const { buildJobPayload } = require('./scorer');
+const { parseStringPromise } = require('xml2js');
+const { pushToWebhook }      = require('./webhook');
+const { buildJobPayload }    = require('./scorer');
 
-const JOB_TTL_SECONDS = 60 * 60 * 24 * 7;
-const TARGET_URL      = 'https://www.upwork.com/nx/find-work/most-recent';
-
-const USER_AGENTS = [
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0',
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0',
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 14.4; rv:125.0) Gecko/20100101 Firefox/125.0',
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0',
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36 Edg/123.0.0.0',
-];
-
-function randomUA() {
-  return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
-}
+const RSS_BASE   = 'https://www.upwork.com/ab/feed/jobs/rss';
+const TIMEOUT_MS = 15_000;
 
 function randomIntervalMs() {
   const min = 4 * 60 * 1000;
@@ -30,153 +13,141 @@ function randomIntervalMs() {
   return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
-// ── ユーザーの条件と案件がマッチするか判定 ────────────────────────────────
-function matchesUser(payload, user) {
-  // リスクスコアチェック
+async function fetchRSSJobs(keywords = '') {
+  const params = new URLSearchParams({ q: keywords || '', sort: 'recency' });
+  const url    = `${RSS_BASE}?${params}`;
+  const controller = new AbortController();
+  const timer      = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  try {
+    const res = await fetch(url, { signal: controller.signal });
+    if (!res.ok) throw new Error(`RSS fetch failed: ${res.status}`);
+    const xml  = await res.text();
+    const data = await parseStringPromise(xml, { explicitArray: false });
+    const items = data?.rss?.channel?.item || [];
+    return Array.isArray(items) ? items : [items];
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function extractJobId(item) {
+  const link = item.link || '';
+  const match = link.match(/jobs\/([^?&\s]+)/);
+  return match ? match[1] : null;
+}
+
+function extractClientInfo(description) {
+  const text = description.replace(/<[^>]+>/g, ' ');
+  const paymentVerified = /payment\s+verified/i.test(text);
+  const spentMatch      = text.match(/\$([\d,]+(?:\.\d+)?)\s*total\s*spent/i);
+  const totalSpent      = spentMatch ? parseFloat(spentMatch[1].replace(/,/g, '')) : 0;
+  const hiresMatch      = text.match(/(\d+)\s*hire/i);
+  const totalHires      = hiresMatch ? parseInt(hiresMatch[1]) : 0;
+  const ratingMatch     = text.match(/([\d.]+)\s*of\s*5/i);
+  const totalFeedback   = ratingMatch ? parseFloat(ratingMatch[1]) : 0;
+  const reviewMatch     = text.match(/(\d+)\s*review/i);
+  const totalReviews    = reviewMatch ? parseInt(reviewMatch[1]) : 0;
+  let country = 'Unknown';
+  const countryMatch = text.match(/(?:Location|Client Location):\s*([^\n<]+)/i);
+  if (countryMatch) country = countryMatch[1].trim();
+  return {
+    paymentVerificationStatus: paymentVerified ? 2 : 0,
+    totalSpent,
+    totalHires,
+    totalFeedback,
+    totalReviews,
+    location: { country },
+  };
+}
+
+function rssItemToJob(item) {
+  const title      = item.title || '';
+  const rawDesc    = item['content:encoded'] || item.description || '';
+  const cleanDesc  = rawDesc.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+  const link       = item.link || '';
+  const jobId      = extractJobId(item);
+  const category   = Array.isArray(item.category) ? item.category[0] : (item.category || null);
+  const clientInfo = extractClientInfo(rawDesc);
+
+  let budget = null, budgetAmount = 0;
+  const hourlyMatch = rawDesc.match(/\$([\d,]+(?:\.\d+)?)\s*[-–]\s*\$([\d,]+(?:\.\d+)?)\s*(?:\/hr|hourly)/i);
+  const fixedMatch  = rawDesc.match(/Budget:\s*\$([\d,]+(?:\.\d+)?)/i);
+  const anyMatch    = rawDesc.match(/\$([\d,]+(?:\.\d+)?)/);
+  if (hourlyMatch) {
+    budgetAmount = parseFloat(hourlyMatch[1].replace(/,/g, ''));
+    budget = `$${hourlyMatch[1]}–$${hourlyMatch[2]}/hr`;
+  } else if (fixedMatch) {
+    budgetAmount = parseFloat(fixedMatch[1].replace(/,/g, ''));
+    budget = `$${fixedMatch[1]} fixed`;
+  } else if (anyMatch) {
+    budgetAmount = parseFloat(anyMatch[1].replace(/,/g, ''));
+    budget = `$${anyMatch[1]}`;
+  }
+
+  const skillsMatch = rawDesc.match(/Skills\s*:\s*([^<\n]+)/i);
+  const skills      = skillsMatch ? skillsMatch[1].trim() : '';
+
+  return {
+    ciphertext: jobId, title,
+    description: cleanDesc.slice(0, 300),
+    url: link, budget, budgetAmount, skills, category,
+    publishedOn: item.pubDate || null,
+    client: clientInfo,
+  };
+}
+
+function matchesUser(payload, user, fetchedKeywords) {
   if (payload.risk_score > user.max_risk) return false;
-
-  // 予算下限チェック
   if (user.min_budget && user.min_budget > 0) {
-    if (payload.budget_amount < user.min_budget) return false;
+    if ((payload.budget_amount || 0) < user.min_budget) return false;
   }
-
-  // キーワードチェック（title + description + skills のいずれかに含まれるか）
   if (user.keywords) {
-    const keywords = user.keywords.toLowerCase().split(',').map(k => k.trim()).filter(Boolean);
-    const searchText = [
-      payload.title,
-      payload.description,
-      payload.skills,
-    ].join(' ').toLowerCase();
-
-    const hasKeyword = keywords.some(kw => searchText.includes(kw));
-    if (!hasKeyword) return false;
+    const userKws    = user.keywords.toLowerCase().split(',').map(k => k.trim()).filter(Boolean);
+    const fetchedKws = (fetchedKeywords || '').toLowerCase().split(',').map(k => k.trim()).filter(Boolean);
+    const hasMatch   = userKws.some(kw => fetchedKws.some(fk => fk.includes(kw) || kw.includes(fk)));
+    if (!hasMatch) return false;
   }
-
-  // カテゴリチェック
   if (user.categories && payload.category) {
-    const categories = user.categories.toLowerCase().split(',').map(c => c.trim()).filter(Boolean);
-    const jobCategory = payload.category.toLowerCase();
-    const hasCategory = categories.some(cat => jobCategory.includes(cat));
-    if (!hasCategory) return false;
+    const cats   = user.categories.toLowerCase().split(',').map(c => c.trim()).filter(Boolean);
+    const jobCat = payload.category.toLowerCase();
+    if (!cats.some(c => jobCat.includes(c))) return false;
   }
-
   return true;
 }
 
-async function runScanner({ account, users, redis, pg }) {
-  const rawCookies = typeof account.session_json === 'string'
-    ? JSON.parse(account.session_json)
-    : account.session_json;
+async function runScanner({ users, redis }) {
+  const keywordSets = [...new Set(
+    users.map(u => (u.keywords || '').toLowerCase().trim()).filter(Boolean)
+  )];
+  if (users.some(u => !u.keywords)) keywordSets.unshift('');
 
-  const validCookies = rawCookies.map(cookie => {
-    const c = { ...cookie };
-    if (c.sameSite === 'no_restriction') c.sameSite = 'None';
-    if (c.sameSite === 'unspecified' || !['Strict', 'Lax', 'None'].includes(c.sameSite)) {
-      delete c.sameSite;
+  let totalNew = 0, totalSent = 0;
+
+  for (const keywords of keywordSets) {
+    console.log(`🔍 Fetching RSS: "${keywords || '(no keyword)'}"`);
+    let items;
+    try {
+      items = await fetchRSSJobs(keywords);
+    } catch (err) {
+      console.error(`❌ RSS fetch error: ${err.message}`);
+      continue;
     }
-    return c;
-  });
+    console.log(`👀 Got ${items.length} jobs`);
 
-  const ua = randomUA();
-  console.log(`🌐 Using UA: ${ua.slice(0, 60)}...`);
-
-  const browser = await chromium.launch({
-    headless: true,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-      '--single-process',
-      '--disable-extensions',
-    ],
-  });
-
-  const context = await browser.newContext({
-    userAgent: ua,
-    locale: 'en-US',
-    timezoneId: 'Europe/Amsterdam',
-    extraHTTPHeaders: {
-      'Accept-Language': 'en-US,en;q=0.9',
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-      'Referer': 'https://www.upwork.com/',
-    },
-  });
-
-  try {
-    await context.addCookies(validCookies);
-    const page = await context.newPage();
-
-    const response = await page.goto(TARGET_URL, {
-      waitUntil: 'domcontentloaded',
-      timeout: 30_000,
-    });
-
-    const currentUrl = page.url();
-
-    if (
-      currentUrl.includes('/login') ||
-      currentUrl.includes('/ab/account-security') ||
-      (response && response.status() === 403)
-    ) {
-      await markBanned(pg, account);
-      throw new Error(`BANNED: account ${account.email} redirected to ${currentUrl}`);
-    }
-
-    const isCaptcha = await page.evaluate(() => {
-      const title = document.title.toLowerCase();
-      return (
-        title.includes('captcha') ||
-        title.includes('blocked') ||
-        !!document.querySelector('iframe[src*="recaptcha"]') ||
-        !!document.querySelector('[data-sitekey]')
-      );
-    });
-
-    if (isCaptcha) {
-      console.warn(`🤖 CAPTCHA detected for ${account.email}. Skipping round.`);
-      throw new Error(`CAPTCHA: account ${account.email}`);
-    }
-
-    const jobs = await page.evaluate(() => {
-      const nuxt = window.__NUXT__?.state;
-      if (nuxt) {
-        return (
-          nuxt.feedMostRecent?.jobs ||
-          nuxt['feed-most-recent']?.jobs ||
-          []
-        );
-      }
-      return [];
-    });
-
-    console.log(`👀 [${account.email}] Scraped ${jobs.length} jobs.`);
-    if (jobs.length === 0) {
-      console.warn('⚠️ No jobs found — Upwork may have changed their Nuxt state structure.');
-      return;
-    }
-
-    let newCount  = 0;
-    let sentCount = 0;
-
-    for (const job of jobs) {
-      if (!job.ciphertext) continue;
-
-      const redisKey = `seen:${job.ciphertext}`;
-      const isNew    = await redis.set(redisKey, '1', { NX: true, EX: JOB_TTL_SECONDS });
+    for (const item of items) {
+      const jobId = extractJobId(item);
+      if (!jobId) continue;
+      const redisKey = `seen:${jobId}`;
+      const isNew    = await redis.set(redisKey, '1', { NX: true, EX: 60 * 60 * 24 * 7 });
       if (!isNew) continue;
-
-      newCount++;
+      totalNew++;
+      const job     = rssItemToJob(item);
       const payload = buildJobPayload(job);
-
       for (const user of users) {
-        if (matchesUser(payload, user)) {
-          const result = await pushToWebhook(user.webhook_url, [payload], {
-            totalScanned: jobs.length,
-          });
+        if (matchesUser(payload, user, keywords)) {
+          const result = await pushToWebhook(user.webhook_url, [payload], { totalScanned: items.length });
           if (result.ok) {
-            sentCount++;
+            totalSent++;
             console.log(`🎯 Sent "${payload.title.slice(0, 40)}..." → User ${user.id}`);
           } else {
             console.warn(`⚠️ Webhook failed for User ${user.id}:`, result.status || result.error);
@@ -184,22 +155,8 @@ async function runScanner({ account, users, redis, pg }) {
         }
       }
     }
-
-    console.log(`✅ Round complete. New: ${newCount}, Sent: ${sentCount}`);
-  } catch (err) {
-    console.error(`❌ Scraper error [${account.email}]: ${err.message}`);
-    throw err;
-  } finally {
-    await browser.close();
   }
-}
-
-async function markBanned(pg, account) {
-  await pg.query(
-    "UPDATE burner_accounts SET status = 'banned' WHERE id = $1",
-    [account.id]
-  );
-  console.warn(`🚫 Account ${account.email} marked as banned in DB.`);
+  console.log(`✅ Round complete. New: ${totalNew}, Sent: ${totalSent}`);
 }
 
 module.exports = { runScanner, randomIntervalMs };

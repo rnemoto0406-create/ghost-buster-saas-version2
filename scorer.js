@@ -8,7 +8,7 @@ function scoreJob(client = {}) {
     risk += 25;
     flags.push('Payment not verified');
   }
-  if (!client.totalSpent || client.totalSpent === 0) {
+  if (!client.totalSpent?.amount || client.totalSpent.amount === 0) {
     risk += 15;
     flags.push('$0 spent');
   }
@@ -32,47 +32,23 @@ function buildJobPayload(job) {
   const client          = job.client || {};
   const { risk, flags } = scoreJob(client);
 
-  let budget       = null;
-  let budgetAmount = 0;
-
-  if (job.hourlyBudget?.min || job.hourlyBudget?.max) {
-    budget       = `$${job.hourlyBudget.min || 0}–$${job.hourlyBudget.max || '?'}/hr`;
-    budgetAmount = job.hourlyBudget.min || job.hourlyBudget.max || 0;
-  } else if (job.amount?.amount) {
-    budget       = `$${job.amount.amount} fixed`;
-    budgetAmount = job.amount.amount;
-  }
-
-  const skills = (job.skills || [])
-    .map((s) => s.prettyName || s.name)
-    .filter(Boolean)
-    .join(', ');
-
-  const category = job.occupationalCategory
-    || job.category2?.name
-    || job.subcategory2?.name
-    || null;
-
-  const desc = job.description || '';
-
   return {
-    title:         job.title || 'Untitled',
-    url:           `https://www.upwork.com/jobs/${job.ciphertext}`,
-    description:   desc.length > 300 ? desc.slice(0, 300) + '…' : desc,
-    budget,
-    budget_amount: budgetAmount,
-    skills,
-    category,
-    posted_date:   job.publishedOn || job.createdOn || null,
-    applicants:    job.proposalsTier || null,
+    title:         job.title        || 'Untitled',
+    url:           job.url          || `https://www.upwork.com/jobs/${job.ciphertext}`,
+    description:   job.description  || '',
+    budget:        job.budget       || null,
+    budget_amount: job.budgetAmount || 0,
+    skills:        job.skills       || '',
+    category:      job.category     || null,
+    posted_date:   job.publishedOn  || null,
     risk_score:    risk,
     risk_flags:    flags,
     client: {
-      country:          client.location?.country || 'Unknown',
-      total_hires:      client.totalHires      || 0,
-      total_spent:      client.totalSpent      || 0,
-      total_feedback:   client.totalFeedback   || 0,
-      total_reviews:    client.totalReviews    || 0,
+      country:          client.location?.country  || 'Unknown',
+      total_hires:      client.totalHires         || 0,
+      total_spent:      client.totalSpent?.amount || 0,
+      total_feedback:   client.totalFeedback      || 0,
+      total_reviews:    client.totalReviews       || 0,
       payment_verified: client.paymentVerificationStatus === 2,
     },
   };
