@@ -101,19 +101,25 @@ app.post('/register', async (req, res) => {
 
 app.post('/uphunt-webhook', async (req, res) => {
   try {
+    console.log('RAW DATA:', JSON.stringify(req.body, null, 2));
     const jobs = Array.isArray(req.body) ? req.body : [req.body];
     console.log(`📥 Received ${jobs.length} job(s) from UpHunt`);
 
     const { rows: users } = await pgClient.query(
       'SELECT * FROM users WHERE is_active = true'
     );
+    console.log(`👥 Found ${users.length} active user(s)`);
 
     for (const job of jobs) {
       const payload = buildJobPayload(job);
-      console.log(`🔍 Job: "${(payload.title||'').slice(0, 50)}" Risk: ${payload.risk_score}`);
+      console.log(`🔍 Job: "${(payload.title||'').slice(0, 50)}" Risk: ${payload.risk_score} Budget: ${payload.budget_amount}`);
 
       for (const user of users) {
-        if (!matchesUser(payload, user)) continue;
+        console.log(`🧪 Checking User ${user.id}: max_risk=${user.max_risk} min_budget=${user.min_budget} keywords=${user.keywords}`);
+        if (!matchesUser(payload, user)) {
+          console.log(`⏭️ Skipped User ${user.id}`);
+          continue;
+        }
         const result = await sendWebhook(user.webhook_url, payload);
         if (result.ok) {
           console.log(`🎯 Sent to User ${user.id}`);
@@ -131,14 +137,23 @@ app.post('/uphunt-webhook', async (req, res) => {
 });
 
 function matchesUser(payload, user) {
-  if (payload.risk_score > user.max_risk) return false;
+  if (payload.risk_score > user.max_risk) {
+    console.log(`❌ Risk score ${payload.risk_score} > max_risk ${user.max_risk}`);
+    return false;
+  }
   if (user.min_budget && user.min_budget > 0) {
-    if ((payload.budget_amount || 0) < user.min_budget) return false;
+    if ((payload.budget_amount || 0) < user.min_budget) {
+      console.log(`❌ Budget ${payload.budget_amount} < min_budget ${user.min_budget}`);
+      return false;
+    }
   }
   if (user.keywords) {
     const keywords = user.keywords.toLowerCase().split(',').map(k => k.trim()).filter(Boolean);
     const text = [payload.title, payload.description, payload.skills].join(' ').toLowerCase();
-    if (!keywords.some(kw => text.includes(kw))) return false;
+    if (!keywords.some(kw => text.includes(kw))) {
+      console.log(`❌ No keyword match`);
+      return false;
+    }
   }
   return true;
 }
