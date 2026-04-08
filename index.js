@@ -2,21 +2,22 @@
 
 require('dotenv').config();
 
-const { Client }       = require('pg');
-const { createClient } = require('redis');
-const { runScanner, randomIntervalMs } = require('./scraper');
-const express          = require('express');
+const { Client }  = require('pg');
+const express     = require('express');
+const { buildJobPayload } = require('./scorer');
 
-const RETRY_INTERVAL_MS = 5 * 60 * 1000;
-
-// ── Web registration server ───────────────────────────────────────────────
 const app = express();
-app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-let pgClient, redisClient;
+let pgClient;
 
-// Registration form
+async function startDB() {
+  pgClient = new Client({ connectionString: process.env.DATABASE_URL });
+  await pgClient.connect();
+  console.log('✅ DB Connected (Postgres)');
+}
+
 app.get('/', (req, res) => {
   res.send(`
     <!DOCTYPE html>
@@ -44,27 +45,22 @@ app.get('/', (req, res) => {
           <form action="/register" method="POST">
             <label>Email</label>
             <input type="email" name="email" required placeholder="you@example.com" />
-
             <label>Webhook URL</label>
             <small>Discord or Slack webhook URL where you want to receive job alerts.</small>
             <input type="url" name="webhook_url" required placeholder="https://discord.com/api/webhooks/..." />
-
             <label>Keywords</label>
-            <small>Comma-separated keywords to filter jobs. e.g. python, data entry, writing</small>
+            <small>Comma-separated keywords. e.g. python, data entry, writing</small>
             <input type="text" name="keywords" placeholder="python, scraping, automation" />
-
             <label>Minimum Budget (USD)</label>
             <input type="number" name="min_budget" placeholder="0" min="0" value="0" />
-
             <label>Max Risk Score</label>
-            <small>Jobs with a risk score above this will be filtered out. (0 = strictest, 100 = all jobs)</small>
+            <small>Jobs above this score will be filtered out. (0 = strictest, 100 = all jobs)</small>
             <select name="max_risk">
               <option value="20">20 - Very strict</option>
               <option value="40" selected>40 - Recommended</option>
               <option value="60">60 - Relaxed</option>
               <option value="100">100 - All jobs</option>
             </select>
-
             <button type="submit">Start Monitoring →</button>
           </form>
         </div>
@@ -73,7 +69,6 @@ app.get('/', (req, res) => {
   `);
 });
 
-// Handle registration
 app.post('/register', async (req, res) => {
   const { email, webhook_url, keywords, min_budget, max_risk } = req.body;
   try {
@@ -91,84 +86,93 @@ app.post('/register', async (req, res) => {
     res.send(`
       <!DOCTYPE html>
       <html>
-        <head><title>Ghost Buster - Success</title><meta name="viewport" content="width=device-width, initial-scale=1">
-        <style>* { box-sizing: border-box; } body { font-family: -apple-system, sans-serif; background: #f5f5f5; display: flex; align-items: center; justify-content: center; min-height: 100vh; } .card { background: white; padding: 2rem; border-radius: 12px; box-shadow: 0 2px 16px rgba(0,0,0,0.1); max-width: 480px; width: 100%; text-align: center; } h1 { color: #14a800; margin-bottom: 1rem; } p { color: #666; }</style>
-        </head>
-        <body><div class="card"><h1>✅ You're all set!</h1><p>Job alerts will start arriving at your webhook shortly. You can close this page.</p></div></body>
+        <head><title>Ghost Buster - Success</title></head>
+        <body style="font-family:sans-serif;text-align:center;padding:2rem;">
+          <h2 style="color:#14a800;">✅ You're all set!</h2>
+          <p>Job alerts will start arriving at your webhook shortly.</p>
+        </body>
       </html>
     `);
   } catch (err) {
     console.error(err);
-    res.status(500).send(`
-      <!DOCTYPE html>
-      <html>
-        <head><title>Error</title></head>
-        <body style="font-family:sans-serif;text-align:center;padding:2rem;">
-          <h2 style="color:red;">❌ Registration failed</h2>
-          <p>Please try again or contact support.</p>
-        </body>
-      </html>
-    `);
+    res.status(500).send('Registration failed.');
   }
 });
+
+app.post('/uphunt-webhook', async (req, res) => {
+  try {
+    const jobs = Array.isArray(req.body) ? req.body : [req.body];
+    console.log(`📥 Received ${jobs.length} job(s) from UpHunt`);
+
+    const { rows: users } = await pgClient.query(
+      'SELECT * FROM users WHERE is_active = true'
+    );
+
+    for (const job of jobs) {
+      const payload = buildJobPayload(job);
+      console.log(`🔍 Job: "${(payload.title||'').slice(0, 50)}" Risk: ${payload.risk_score}`);
+
+      for (const user of users) {
+        if (!matchesUser(payload, user)) continue;
+        const result = await sendWebhook(user.webhook_url, payload);
+        if (result.ok) {
+          console.log(`🎯 Sent to User ${user.id}`);
+        } else {
+          console.warn(`⚠️ Webhook failed for User ${user.id}:`, result.error || result.status);
+        }
+      }
+    }
+
+    res.status(200).json({ ok: true });
+  } catch (err) {
+    console.error('❌ Webhook error:', err.message);
+    res.status(500).json({ ok: false });
+  }
+});
+
+function matchesUser(payload, user) {
+  if (payload.risk_score > user.max_risk) return false;
+  if (user.min_budget && user.min_budget > 0) {
+    if ((payload.budget_amount || 0) < user.min_budget) return false;
+  }
+  if (user.keywords) {
+    const keywords = user.keywords.toLowerCase().split(',').map(k => k.trim()).filter(Boolean);
+    const text = [payload.title, payload.description, payload.skills].join(' ').toLowerCase();
+    if (!keywords.some(kw => text.includes(kw))) return false;
+  }
+  return true;
+}
+
+async function sendWebhook(webhookUrl, payload) {
+  const message =
+    `**${payload.title}**\n` +
+    `💰 ${payload.budget || 'N/A'}\n` +
+    `⚠️ Risk Score: ${payload.risk_score}${payload.risk_flags?.length ? ` (${payload.risk_flags.join(', ')})` : ''}\n` +
+    `🔗 ${payload.url}`;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15000);
+  try {
+    const res = await fetch(webhookUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: message, text: message }),
+      signal: controller.signal,
+    });
+    return res.ok ? { ok: true } : { ok: false, status: res.status };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🌐 Registration server running on port ${PORT}`);
+  console.log(`🌐 Server running on port ${PORT}`);
 });
 
-// ── DB connection ─────────────────────────────────────────────────────────
-async function startDB() {
-  pgClient    = new Client({ connectionString: process.env.DATABASE_URL });
-  redisClient = createClient({
-    url: process.env.REDIS_URL,
-    socket: {
-      reconnectStrategy: (retries) => Math.min(retries * 500, 5000),
-    },
-  });
-
-  redisClient.on('error', (err) => console.error('⚠️ Redis error:', err.message));
-
-  await pgClient.connect();
-  await redisClient.connect();
-  console.log('✅ DB Connected (Postgres & Redis)');
-}
-
-// ── Main scan loop ────────────────────────────────────────────────────────
-async function startSaaS() {
-  try {
-    await startDB();
-  } catch (err) {
-    console.error('💀 Failed to connect to DBs:', err.message);
-    process.exit(1);
-  }
-
-  while (true) {
-    console.log(`\n🔄 [${new Date().toISOString()}] Starting scan round...`);
-
-    try {
-      const { rows: users } = await pgClient.query(
-        'SELECT * FROM users WHERE is_active = true'
-      );
-
-      if (users.length === 0) {
-        console.warn('⚠️ No active users. Waiting...');
-        await sleep(RETRY_INTERVAL_MS);
-        continue;
-      }
-
-      await runScanner({ users, redis: redisClient, pg: pgClient });
-
-    } catch (err) {
-      console.error('❌ Loop error:', err.message);
-    }
-
-    await sleep(randomIntervalMs());
-  }
-}
-
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
-startSaaS();
+startDB().catch(err => {
+  console.error('💀 Failed to connect to DBs:', err.message);
+  process.exit(1);
+});

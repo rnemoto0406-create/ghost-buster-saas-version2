@@ -1,7 +1,7 @@
 {
   "name": "ghost-buster-saas",
-  "version": "3.0.0",
-  "description": "Upwork Job Scanner SaaS - RSS + API version",
+  "version": "4.0.0",
+  "description": "Upwork Job Scanner SaaS - UpHunt webhook version",
   "main": "index.js",
   "engines": {
     "node": ">=20"
@@ -9,9 +9,7 @@
   "dependencies": {
     "dotenv": "^16.4.5",
     "express": "^4.18.2",
-    "pg": "^8.11.3",
-    "redis": "^4.6.10",
-    "xml2js": "^0.6.2"
+    "pg": "^8.11.3"
   },
   "scripts": {
     "start": "node index.js"
